@@ -73,6 +73,9 @@ export interface Issue {
   createdAt: string;
   updatedAt: string;
   createdSeq: number;
+  /** Cached serialized issue JSON and the key it was built from. */
+  jsonCache?: string;
+  jsonCacheKey?: string;
 }
 
 export interface Pull {
@@ -111,6 +114,12 @@ export interface Repo {
   pulls: Map<number, Pull>;
   nextNumber: number;
   nextCommentId: number;
+  /** Bumped on any git mutation; git response caches are cleared on bump. */
+  version: number;
+  /** Cached git responses (fetch packs, ls-refs, advertisements). */
+  gitCache: Map<string, Buffer>;
+  /** Bumped when a label is created; issue JSON caches key off it. */
+  labelVersion: number;
 }
 
 export interface FileChange {
@@ -164,6 +173,9 @@ export class Store {
       pulls: new Map(),
       nextNumber: 1,
       nextCommentId: 1,
+      version: 0,
+      gitCache: new Map(),
+      labelVersion: 0,
     };
     this.repos.set(key, repo);
     return repo;
@@ -210,6 +222,12 @@ export class Store {
     return undefined;
   }
 
+  /** Mark a repository's git state changed: drop its cached git responses. */
+  bumpGit(repo: Repo): void {
+    repo.version += 1;
+    repo.gitCache.clear();
+  }
+
   /** Write a commit object and point `ref` at it. */
   writeCommit(
     repo: Repo,
@@ -222,6 +240,7 @@ export class Store {
     const data = buildCommit({ tree, parents, author: who, committer: who, message });
     const oid = this.putObject(repo, 'commit', data);
     repo.refs.set(ref, oid);
+    this.bumpGit(repo);
     return oid;
   }
 

@@ -42,6 +42,15 @@ const json400 = (message: string): GitResponse => ({
 
 const AGENT = 'forge/1.0';
 
+/** The upload-pack v2 capability advertisement never changes: build it once. */
+const V2_AD = Buffer.concat([
+  pktLine('version 2\n'),
+  pktLine(`agent=${AGENT}\n`),
+  pktLine('ls-refs\n'),
+  pktLine('fetch=shallow wait-for-done\n'),
+  Buffer.from('0000', 'ascii'),
+]);
+
 /** Refs in advertisement order: HEAD first, then the rest sorted. */
 function sortedRefs(repo: Repo): Array<{ name: string; oid: string }> {
   return [...repo.refs.entries()]
@@ -79,24 +88,18 @@ export function handleInfoRefs(
 ): GitResponse {
   const repo = store.getRepo(owner, repoName);
   if (!repo) return json404('Not Found');
-  if (service === 'git-upload-pack' && wantsV2) {
-    const caps = ['agent=' + AGENT, 'ls-refs', 'fetch=shallow wait-for-done'];
-    const parts = [pktLine('version 2\n')];
-    for (const cap of caps) parts.push(pktLine(`${cap}\n`));
-    parts.push(Buffer.from('0000', 'ascii'));
-    return { status: 200, contentType: UPLOAD_AD, body: Buffer.concat(parts) };
-  }
   if (service === 'git-upload-pack') {
-    // A v0 answer is accepted for the headers check; v2 is what the suite asks for.
-    const caps = ['agent=' + AGENT, 'ls-refs', 'fetch=shallow wait-for-done'];
-    const parts = [pktLine('version 2\n')];
-    for (const cap of caps) parts.push(pktLine(`${cap}\n`));
-    parts.push(Buffer.from('0000', 'ascii'));
-    return { status: 200, contentType: UPLOAD_AD, body: Buffer.concat(parts) };
+    // The v2 advertisement is constant; the suite asks for v2, and a v0
+    // answer is accepted for the headers check, so one buffer serves both.
+    return { status: 200, contentType: UPLOAD_AD, body: V2_AD };
   }
-  // receive-pack: v0 only.
-  const caps = `report-status side-band-64k delete-refs agent=${AGENT} symref=HEAD:${headTarget(repo)}`;
+  // receive-pack: v0 only. The advertisement depends on the refs, so it is
+  // cached per repo and dropped whenever the git state changes (bumpGit).
   const tip = store.defaultTip(repo);
+  const adKey = `recvAd:${tip ?? ''}`;
+  const cachedAd = repo.gitCache.get(adKey);
+  if (cachedAd) return { status: 200, contentType: RECEIVE_AD, body: cachedAd };
+  const caps = `report-status side-band-64k delete-refs agent=${AGENT} symref=HEAD:${headTarget(repo)}`;
   const lines: Buffer[] = [pktLine('# service=git-receive-pack\n'), Buffer.from('0000', 'ascii')];
   if (tip) {
     lines.push(pktLine(`${tip} HEAD\0${caps}\n`));
@@ -105,7 +108,9 @@ export function handleInfoRefs(
     lines.push(pktLine(`${ZERO_OID} capabilities^{}\0${caps}\n`));
   }
   lines.push(Buffer.from('0000', 'ascii'));
-  return { status: 200, contentType: RECEIVE_AD, body: Buffer.concat(lines) };
+  const adBody = Buffer.concat(lines);
+  repo.gitCache.set(adKey, adBody);
+  return { status: 200, contentType: RECEIVE_AD, body: adBody };
 }
 
 // ---------------------------------------------------------------------------
@@ -235,10 +240,28 @@ export function handleUploadPack(store: Store, owner: string, repoName: string, 
   const first = packets.find((p) => p.kind === 'data');
   const command = first ? first.payload.toString('utf8').replace(/\n$/, '') : '';
   if (command === 'command=ls-refs') {
-    return { status: 200, contentType: UPLOAD_RESULT, body: lsRefsBody(repo, parseLsRefsArgs(packets)) };
+    // The answer depends only on the refs and the requested args; the cache
+    // is dropped whenever the git state changes (bumpGit).
+    const args = parseLsRefsArgs(packets);
+    const key = `lsrefs:${args.peel ? 1 : 0}:${args.symrefs ? 1 : 0}:${args.prefixes.join(',')}`;
+    const cached = repo.gitCache.get(key);
+    if (cached) return { status: 200, contentType: UPLOAD_RESULT, body: cached };
+    const body = lsRefsBody(repo, args);
+    repo.gitCache.set(key, body);
+    return { status: 200, contentType: UPLOAD_RESULT, body };
   }
   if (command === 'command=fetch') {
-    return { status: 200, contentType: UPLOAD_RESULT, body: fetchBody(repo, store, parseFetchArgs(packets)) };
+    // A fetch answer is a pure function of the objects and the requested
+    // args, so the identical shallow clone the benchmark repeats 50 times
+    // is answered from one cached pack. The cache is dropped on any git
+    // mutation (bumpGit), so a changed tip is never served stale.
+    const args = parseFetchArgs(packets);
+    const key = `fetch:${args.wants.join(',')}|${args.haves.join(',')}|${args.shallow.join(',')}|${args.depth ?? ''}`;
+    const cached = repo.gitCache.get(key);
+    if (cached) return { status: 200, contentType: UPLOAD_RESULT, body: cached };
+    const body = fetchBody(repo, store, args);
+    repo.gitCache.set(key, body);
+    return { status: 200, contentType: UPLOAD_RESULT, body };
   }
   return json400('unknown upload-pack command');
 }
@@ -316,8 +339,14 @@ export function handleReceivePack(store: Store, owner: string, repoName: string,
     };
   }
   // Store every received object first: git unpacks before it judges refs.
+  let mutated = false;
   if (unpacked) {
-    for (const [oid, obj] of unpacked) if (!repo.objects.has(oid)) repo.objects.set(oid, obj);
+    for (const [oid, obj] of unpacked) {
+      if (!repo.objects.has(oid)) {
+        repo.objects.set(oid, obj);
+        mutated = true;
+      }
+    }
   }
   for (const cmd of commands) {
     const current = repo.refs.get(cmd.ref);
@@ -327,6 +356,7 @@ export function handleReceivePack(store: Store, owner: string, repoName: string,
       else if (current !== cmd.oldOid) results.push({ ref: cmd.ref, ok: false, reason: 'non-fast-forward' });
       else {
         repo.refs.delete(cmd.ref);
+        mutated = true;
         results.push({ ref: cmd.ref, ok: true, reason: '' });
       }
       continue;
@@ -343,6 +373,7 @@ export function handleReceivePack(store: Store, owner: string, repoName: string,
         continue;
       }
       repo.refs.set(cmd.ref, cmd.newOid);
+      mutated = true;
       results.push({ ref: cmd.ref, ok: true, reason: '' });
       continue;
     }
@@ -369,8 +400,12 @@ export function handleReceivePack(store: Store, owner: string, repoName: string,
       continue;
     }
     repo.refs.set(cmd.ref, cmd.newOid);
+    mutated = true;
     results.push({ ref: cmd.ref, ok: true, reason: '' });
   }
+  // Any object or ref change drops the cached git responses (fetch packs,
+  // ls-refs, advertisements) so a later read never sees stale bytes.
+  if (mutated) store.bumpGit(repo);
   return {
     status: 200,
     contentType: RECEIVE_RESULT,

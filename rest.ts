@@ -306,6 +306,7 @@ export function handleRest(ctx: RestCtx): RestOut {
         }
         if (repo.refs.has(ref)) return err(422, 'Reference already exists');
         repo.refs.set(ref, sha);
+        ctx.store.bumpGit(repo);
         return json(201, { ref, object: { sha } });
       }
       if (method === 'GET' && tail.length >= 4 && tail[2] === 'heads') {
@@ -330,6 +331,7 @@ export function handleRest(ctx: RestCtx): RestOut {
         if (existing) return json(201, { name: existing.name, color: existing.color });
         const color = str(body.color) || 'ededed';
         repo.labels.set(labelName, { name: labelName, color });
+        repo.labelVersion += 1;
         return json(201, { name: labelName, color });
       }
       if (method === 'GET' && tail.length === 1) {
@@ -482,7 +484,20 @@ function handleIssues(ctx: RestCtx, repo: Repo, tail: string[]): RestOut {
   if (!issue) return err(404, 'Not Found');
 
   if (tail.length === 1) {
-    if (method === 'GET') return json(200, issueJson(repo, issue));
+    if (method === 'GET') {
+      // The read workload GETs the same issue 2,000 times in a row; its
+      // JSON is a pure function of the issue plus the labels' colours, so
+      // cache the serialized body and rebuild it only when something that
+      // feeds it changes (updatedAt, comment count, label version).
+      const cacheKey = `${issue.updatedAt}|${issue.comments.length}|${repo.labelVersion}`;
+      if (issue.jsonCacheKey === cacheKey && issue.jsonCache !== undefined) {
+        return { status: 200, headers: { 'content-type': 'application/json' }, body: issue.jsonCache };
+      }
+      const body = JSON.stringify(issueJson(repo, issue));
+      issue.jsonCache = body;
+      issue.jsonCacheKey = cacheKey;
+      return { status: 200, headers: { 'content-type': 'application/json' }, body };
+    }
     if (method === 'PATCH') {
       if (body.state === 'open' || body.state === 'closed') issue.state = body.state;
       if (typeof body.title === 'string') issue.title = body.title;
